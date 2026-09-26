@@ -47,7 +47,8 @@ prepare_defconfig() {
 	# 强制启用 mihw 驱动所需的 cgroup 和 netfilter 支持
 	kconf_set_many "$DEFCONFIG_PATH" \
 		CONFIG_CGROUPS=y CONFIG_CGROUP_SCHED=y CONFIG_CGROUP_FREEZER=y \
-		CONFIG_NETFILTER=y CONFIG_NETFILTER_ADVANCED=y
+		CONFIG_NETFILTER=y CONFIG_NETFILTER_ADVANCED=y \
+		CONFIG_NF_CONNTRACK=y CONFIG_NETFILTER_XTABLES=y
 
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
@@ -108,25 +109,55 @@ make_args() {
 	fi
 }
 
-# Patch known-incompatible vendor drivers before compiling.
+# 用 Python 在文件顶部插入 include 和 extern 声明，避免 sed 多行转义问题。
+patch_one_vendor_file() {
+	local file="$1" header="$2"
+	[ -f "$file" ] || return 0
+	grep -q "$header" "$file" && return 0
+
+	python3 - "$file" "$header" <<'PYEOF'
+import sys
+path, header = sys.argv[1], sys.argv[2]
+with open(path, "r") as f:
+    content = f.read()
+with open(path, "w") as f:
+    f.write(header + "\n" + content)
+PYEOF
+	info "patched $(basename "$file")"
+}
+
 patch_vendor_drivers() {
 	local mihw="${KERNEL_DIR}/drivers/mihw"
 	[ -d "$mihw" ] || return 0
 
-	# millet_core.c: cgroup_taskset 需要 cgroup-defs.h
-	if [ -f "${mihw}/millet_core.c" ]; then
-		if ! grep -q '#include <linux/cgroup-defs.h>' "${mihw}/millet_core.c"; then
-			sed -i '1i #include <linux/cgroup.h>\n#include <linux/cgroup-defs.h>' "${mihw}/millet_core.c"
-			info "patched millet_core.c (cgroup.h + cgroup-defs.h)"
-		fi
-	fi
+	# millet_core.c: cgroup_taskset 需要完整定义，光有 cgroup.h 不够
+	patch_one_vendor_file "${mihw}/millet_core.c" \
+		"#include <linux/cgroup.h>
+#include <linux/cgroup-defs.h>"
 
-	# millet_pkg.c: nf_register_net_hooks 需要 netfilter.h 及其 IPv4/IPv6 扩展
-	if [ -f "${mihw}/millet_pkg.c" ]; then
-		if ! grep -q '#include <linux/netfilter.h>' "${mihw}/millet_pkg.c"; then
-			sed -i '1i #include <linux/netfilter.h>\n#include <linux/netfilter_ipv4.h>\n#include <linux/netfilter_ipv6.h>' "${mihw}/millet_pkg.c"
-			info "patched millet_pkg.c (netfilter.h + ipv4/ipv6)"
-		fi
+	# millet_pkg.c: nf_register_net_hooks 在 5.4 头文件里可能没有声明，
+	# 所以直接加 extern 声明，绕过 CONFIG_NETFILTER 的依赖。
+	local pkg_file="${mihw}/millet_pkg.c"
+	if [ -f "$pkg_file" ] && ! grep -q "nf_register_net_hooks" "$pkg_file" | grep -q "extern"; then
+		python3 - "$pkg_file" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, "r") as f:
+    content = f.read()
+header = """#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6.h>
+
+extern int nf_register_net_hooks(struct net *net,
+                                 const struct nf_hook_ops *reg,
+                                 unsigned int n);
+extern void nf_unregister_net_hooks(struct net *net,
+                                    const struct nf_hook_ops *reg);
+"""
+with open(path, "w") as f:
+    f.write(header + content)
+PYEOF
+		info "patched millet_pkg.c (netfilter + extern declarations)"
 	fi
 }
 
