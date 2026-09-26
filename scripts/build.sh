@@ -38,23 +38,18 @@ prepare_defconfig() {
 		fi
 
 		if is_true "${ENABLE_KPM:-false}"; then
-			# patch_linux resolves symbols at runtime, so kallsyms must be complete.
 			kconf_set_many "$DEFCONFIG_PATH" \
 				CONFIG_KPM=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y
 		fi
 	fi
 
-	# 强制启用 mihw 驱动所需的 cgroup 和 netfilter 支持
 	kconf_set_many "$DEFCONFIG_PATH" \
 		CONFIG_CGROUPS=y CONFIG_CGROUP_SCHED=y CONFIG_CGROUP_FREEZER=y \
 		CONFIG_NETFILTER=y CONFIG_NETFILTER_ADVANCED=y \
 		CONFIG_NF_CONNTRACK=y CONFIG_NETFILTER_XTABLES=y
 
-	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
-	# Kept as a standalone switch for kernels that need kprobes for their own
-	# reasons, independent of the hook mode.
 	if is_true "${ADD_KPROBES_CONFIG:-false}"; then
 		kconf_set_many "$DEFCONFIG_PATH" \
 			CONFIG_MODULES=y CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y
@@ -68,10 +63,8 @@ prepare_defconfig() {
 
 	is_true "${DISABLE_CC_WERROR:-false}" && kconf_disable "$DEFCONFIG_PATH" CONFIG_CC_WERROR
 
-	# Free-form extras: one CONFIG_x=y per line, or space separated.
 	if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
 		local kv
-		# shellcheck disable=SC2086
 		for kv in $(printf '%s' "$EXTRA_DEFCONFIG" | tr '\n' ' '); do
 			[ -n "$kv" ] || continue
 			case "$kv" in
@@ -81,8 +74,6 @@ prepare_defconfig() {
 		done
 	fi
 
-	# A stable LOCALVERSION keeps artifact names predictable. Without this the
-	# tree appends "-dirty" as soon as any patch above touches a tracked file.
 	if [ -n "${KERNEL_NAME:-}" ]; then
 		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"-${KERNEL_NAME}\""
 		if [ -f "${KERNEL_DIR}/scripts/setlocalversion" ]; then
@@ -109,7 +100,6 @@ make_args() {
 	fi
 }
 
-# 用 Python 在文件顶部插入 include 和 extern 声明，避免 sed 多行转义问题。
 patch_one_vendor_file() {
 	local file="$1" header="$2"
 	[ -f "$file" ] || return 0
@@ -130,34 +120,40 @@ patch_vendor_drivers() {
 	local mihw="${KERNEL_DIR}/drivers/mihw"
 	[ -d "$mihw" ] || return 0
 
-	# millet_core.c: cgroup_taskset 需要完整定义，光有 cgroup.h 不够
 	patch_one_vendor_file "${mihw}/millet_core.c" \
 		"#include <linux/cgroup.h>
 #include <linux/cgroup-defs.h>"
 
-	# millet_pkg.c: nf_register_net_hooks 在 5.4 头文件里可能没有声明，
-	# 所以直接加 extern 声明，绕过 CONFIG_NETFILTER 的依赖。
 	local pkg_file="${mihw}/millet_pkg.c"
-	if [ -f "$pkg_file" ] && ! grep -q "nf_register_net_hooks" "$pkg_file" | grep -q "extern"; then
+	if [ -f "$pkg_file" ]; then
 		python3 - "$pkg_file" <<'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path, "r") as f:
     content = f.read()
+
 header = """#include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
 
 extern int nf_register_net_hooks(struct net *net,
-                                 const struct nf_hook_ops *reg,
-                                 unsigned int n);
+                                 const struct nf_hook_ops *reg);
 extern void nf_unregister_net_hooks(struct net *net,
                                     const struct nf_hook_ops *reg);
 """
+
+content = content.replace(
+    "nf_register_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops))",
+    "nf_register_net_hooks(net, pkg_nf_ops)"
+).replace(
+    "nf_unregister_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops))",
+    "nf_unregister_net_hooks(net, pkg_nf_ops)"
+)
+
 with open(path, "w") as f:
     f.write(header + content)
 PYEOF
-		info "patched millet_pkg.c (netfilter + extern declarations)"
+		info "patched millet_pkg.c (2-arg netfilter calls)"
 	fi
 }
 
@@ -166,16 +162,8 @@ build_kernel() {
 	export PATH="${CLANG_PATH:-}:${PATH}"
 	export KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-Github-Action}
 	export KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-kernelsu-action}
-
-	# DISABLE_LTO is this action's boolean configuration switch, but several
-	# Android kernel trees use the same Make variable for compiler flags (for
-	# example, "-fno-lto").  Leaving our value in the environment makes a
-	# non-LTO build invoke `clang ... false ...`, treating "false" as an input
-	# file.  prepare_defconfig() has already consumed the action setting, so let
-	# Kbuild own the name from this point on.
 	unset DISABLE_LTO
 
-	# Custom manager signature, when the user builds their own manager APK.
 	if [ -n "${KSU_EXPECTED_SIZE:-}" ] && [ -n "${KSU_EXPECTED_HASH:-}" ]; then
 		export KSU_EXPECTED_SIZE KSU_EXPECTED_HASH
 		info "using custom manager signature (size=${KSU_EXPECTED_SIZE})"
@@ -190,22 +178,17 @@ build_kernel() {
 	fi
 
 	cd "$KERNEL_DIR"
-
-	# Fix vendor drivers that fail to compile with modern Clang.
 	patch_vendor_drivers
 
 	mkdir -p "$OUT"
 	info "make ${args} defconfig (copied from ${KERNEL_CONFIG})"
 	cp "$DEFCONFIG_PATH" "${OUT}/.config"
-	# shellcheck disable=SC2086
 	make -j"$(nproc --all)" CC=clang $args olddefconfig \
 		|| die "defconfig generation failed"
 
 	info "make ${args}"
-	# shellcheck disable=SC2086
 	make -j"$(nproc --all)" CC="$cc" $args \
 		|| die "kernel build failed"
-
 	endgroup
 }
 
@@ -229,13 +212,10 @@ check_output() {
 		ok "dtbo.img present"
 	fi
 
-	# KPM rewrites the image in place, so it has to happen after the build and
-	# before packaging.
 	if is_true "${ENABLE_KPM:-false}"; then
 		kpm_patch_image "$image"
 	fi
 
-	# Record the version string the kernel actually reports.
 	if [ -f "${OUT}/include/generated/utsrelease.h" ]; then
 		local rel
 		rel=$(sed -nE 's/.*UTS_RELEASE[[:space:]]+"([^"]+)".*/\1/p' "${OUT}/include/generated/utsrelease.h")
