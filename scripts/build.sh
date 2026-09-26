@@ -118,15 +118,17 @@ PYEOF
 
 patch_vendor_drivers() {
 	local mihw="${KERNEL_DIR}/drivers/mihw"
-	[ -d "$mihw" ] || return 0
+	local datarmnet_ext="${KERNEL_DIR}/techpack/datarmnet-ext"
 
-	patch_one_vendor_file "${mihw}/millet_core.c" \
-		"#include <linux/cgroup.h>
+	# ---- drivers/mihw ----
+	if [ -d "$mihw" ]; then
+		patch_one_vendor_file "${mihw}/millet_core.c" \
+			"#include <linux/cgroup.h>
 #include <linux/cgroup-defs.h>"
 
-	local pkg_file="${mihw}/millet_pkg.c"
-	if [ -f "$pkg_file" ]; then
-		python3 - "$pkg_file" <<'PYEOF'
+		local pkg_file="${mihw}/millet_pkg.c"
+		if [ -f "$pkg_file" ]; then
+			python3 - "$pkg_file" <<'PYEOF'
 import sys
 path = sys.argv[1]
 with open(path, "r") as f:
@@ -153,7 +155,16 @@ content = content.replace(
 with open(path, "w") as f:
     f.write(header + content)
 PYEOF
-		info "patched millet_pkg.c (2-arg netfilter calls)"
+			info "patched millet_pkg.c (2-arg netfilter calls)"
+		fi
+	fi
+
+	# ---- techpack/datarmnet-ext ----
+	# rmnet_shs 驱动使用 5.10+ 的 rps_map，5.4 内核不支持，直接从 Makefile 中移除 shs/
+	local de_makefile="${datarmnet_ext}/Makefile"
+	if [ -f "$de_makefile" ]; then
+		sed -i 's|obj-y += offload/ shs/|obj-y += offload/|' "$de_makefile"
+		info "patched techpack/datarmnet-ext/Makefile (removed shs/)"
 	fi
 }
 
