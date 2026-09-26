@@ -104,6 +104,24 @@ make_args() {
 	fi
 }
 
+# --------------------------------------------------------------- patches ---
+
+# 在指定文件头部插入一段内容（避免 sed 多行转义问题）
+prepend_to_file() {
+	local file="$1" header="$2"
+	[ -f "$file" ] || return 0
+	grep -qF "$header" "$file" && return 0
+	python3 - "$file" "$header" <<'PYEOF'
+import sys
+path, header = sys.argv[1], sys.argv[2]
+with open(path, "r") as f:
+    content = f.read()
+with open(path, "w") as f:
+    f.write(header + "\n" + content)
+PYEOF
+	info "patched $(basename "$file")"
+}
+
 # 把会引发链接错误的 vendor 驱动从编译列表里彻底移除。
 patch_vendor_drivers() {
 	local drivers_mk="${KERNEL_DIR}/drivers/Makefile"
@@ -117,7 +135,6 @@ patch_vendor_drivers() {
 	fi
 
 	# ---- 2. 禁用 techpack/datarmnet 和 datarmnet-ext ----
-	# 顶层 Makefile 用 find 扫描 techpack/ 下所有目录，把目录改名即可跳过。
 	if [ -d "$datarmnet" ]; then
 		mv "$datarmnet" "${KERNEL_DIR}/techpack/_datarmnet_disabled"
 		info "disabled techpack/datarmnet"
@@ -127,12 +144,13 @@ patch_vendor_drivers() {
 		info "disabled techpack/datarmnet-ext"
 	fi
 
-	# ---- 3. 如果 mihw 目录还在，顺手修一下 include（保留但不再编译）----
+	# ---- 3. 如果 mihw 目录还在，顺手修一下 include ----
 	local mihw="${KERNEL_DIR}/drivers/mihw"
 	if [ -d "$mihw" ]; then
-		patch_one_vendor_file "${mihw}/millet_core.c" \
+		prepend_to_file "${mihw}/millet_core.c" \
 			"#include <linux/cgroup.h>
 #include <linux/cgroup-defs.h>"
+
 		local pkg_file="${mihw}/millet_pkg.c"
 		if [ -f "$pkg_file" ]; then
 			python3 - "$pkg_file" <<'PYEOF'
@@ -163,6 +181,8 @@ PYEOF
 		fi
 	fi
 }
+
+# ----------------------------------------------------------------- build ---
 
 build_kernel() {
 	group "Building kernel"
