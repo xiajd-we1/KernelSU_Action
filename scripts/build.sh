@@ -43,6 +43,10 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 关闭栈保护，避免 __stack_chk_guard 链接错误
+	kconf_set_many "$DEFCONFIG_PATH" \
+		CONFIG_STACKPROTECTOR=n CONFIG_STACKPROTECTOR_STRONG=n
+
 	kconf_set_many "$DEFCONFIG_PATH" \
 		CONFIG_CGROUPS=y CONFIG_CGROUP_SCHED=y CONFIG_CGROUP_FREEZER=y \
 		CONFIG_NETFILTER=y CONFIG_NETFILTER_ADVANCED=y \
@@ -100,32 +104,35 @@ make_args() {
 	fi
 }
 
-patch_one_vendor_file() {
-	local file="$1" header="$2"
-	[ -f "$file" ] || return 0
-	grep -q "$header" "$file" && return 0
-
-	python3 - "$file" "$header" <<'PYEOF'
-import sys
-path, header = sys.argv[1], sys.argv[2]
-with open(path, "r") as f:
-    content = f.read()
-with open(path, "w") as f:
-    f.write(header + "\n" + content)
-PYEOF
-	info "patched $(basename "$file")"
-}
-
+# 把会引发链接错误的 vendor 驱动从编译列表里彻底移除。
 patch_vendor_drivers() {
-	local mihw="${KERNEL_DIR}/drivers/mihw"
+	local drivers_mk="${KERNEL_DIR}/drivers/Makefile"
+	local datarmnet="${KERNEL_DIR}/techpack/datarmnet"
 	local datarmnet_ext="${KERNEL_DIR}/techpack/datarmnet-ext"
 
-	# ---- drivers/mihw ----
+	# ---- 1. 禁用 drivers/mihw（millet 系列）----
+	if [ -f "$drivers_mk" ] && grep -q "CONFIG_MIHW" "$drivers_mk"; then
+		sed -i '/CONFIG_MIHW/d' "$drivers_mk"
+		info "disabled drivers/mihw in drivers/Makefile"
+	fi
+
+	# ---- 2. 禁用 techpack/datarmnet 和 datarmnet-ext ----
+	# 顶层 Makefile 用 find 扫描 techpack/ 下所有目录，把目录改名即可跳过。
+	if [ -d "$datarmnet" ]; then
+		mv "$datarmnet" "${KERNEL_DIR}/techpack/_datarmnet_disabled"
+		info "disabled techpack/datarmnet"
+	fi
+	if [ -d "$datarmnet_ext" ]; then
+		mv "$datarmnet_ext" "${KERNEL_DIR}/techpack/_datarmnet_ext_disabled"
+		info "disabled techpack/datarmnet-ext"
+	fi
+
+	# ---- 3. 如果 mihw 目录还在，顺手修一下 include（保留但不再编译）----
+	local mihw="${KERNEL_DIR}/drivers/mihw"
 	if [ -d "$mihw" ]; then
 		patch_one_vendor_file "${mihw}/millet_core.c" \
 			"#include <linux/cgroup.h>
 #include <linux/cgroup-defs.h>"
-
 		local pkg_file="${mihw}/millet_pkg.c"
 		if [ -f "$pkg_file" ]; then
 			python3 - "$pkg_file" <<'PYEOF'
@@ -133,7 +140,6 @@ import sys
 path = sys.argv[1]
 with open(path, "r") as f:
     content = f.read()
-
 header = """#include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
@@ -143,7 +149,6 @@ extern int nf_register_net_hooks(struct net *net,
 extern void nf_unregister_net_hooks(struct net *net,
                                     const struct nf_hook_ops *reg);
 """
-
 content = content.replace(
     "nf_register_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops))",
     "nf_register_net_hooks(net, pkg_nf_ops)"
@@ -151,20 +156,11 @@ content = content.replace(
     "nf_unregister_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops))",
     "nf_unregister_net_hooks(net, pkg_nf_ops)"
 )
-
 with open(path, "w") as f:
     f.write(header + content)
 PYEOF
-			info "patched millet_pkg.c (2-arg netfilter calls)"
+			info "patched millet_pkg.c"
 		fi
-	fi
-
-	# ---- techpack/datarmnet-ext ----
-	# rmnet_shs 驱动使用 5.10+ 的 rps_map，5.4 内核不支持，直接从 Makefile 中移除 shs/
-	local de_makefile="${datarmnet_ext}/Makefile"
-	if [ -f "$de_makefile" ]; then
-		sed -i 's|obj-y += offload/ shs/|obj-y += offload/|' "$de_makefile"
-		info "patched techpack/datarmnet-ext/Makefile (removed shs/)"
 	fi
 }
 
