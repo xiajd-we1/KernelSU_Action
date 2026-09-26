@@ -44,6 +44,11 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 强制启用 mihw 驱动所需的 cgroup 和 netfilter 支持
+	kconf_set_many "$DEFCONFIG_PATH" \
+		CONFIG_CGROUPS=y CONFIG_CGROUP_SCHED=y CONFIG_CGROUP_FREEZER=y \
+		CONFIG_NETFILTER=y CONFIG_NETFILTER_ADVANCED=y
+
 	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
@@ -108,14 +113,20 @@ patch_vendor_drivers() {
 	local mihw="${KERNEL_DIR}/drivers/mihw"
 	[ -d "$mihw" ] || return 0
 
-	# Missing includes cause implicit-declaration errors under modern Clang.
-	if [ -f "${mihw}/millet_core.c" ] && ! grep -q '#include <linux/cgroup.h>' "${mihw}/millet_core.c"; then
-		sed -i '1i #include <linux/cgroup.h>' "${mihw}/millet_core.c"
-		info "patched millet_core.c (cgroup.h)"
+	# millet_core.c: cgroup_taskset 需要 cgroup-defs.h
+	if [ -f "${mihw}/millet_core.c" ]; then
+		if ! grep -q '#include <linux/cgroup-defs.h>' "${mihw}/millet_core.c"; then
+			sed -i '1i #include <linux/cgroup.h>\n#include <linux/cgroup-defs.h>' "${mihw}/millet_core.c"
+			info "patched millet_core.c (cgroup.h + cgroup-defs.h)"
+		fi
 	fi
-	if [ -f "${mihw}/millet_pkg.c" ] && ! grep -q '#include <linux/netfilter.h>' "${mihw}/millet_pkg.c"; then
-		sed -i '1i #include <linux/netfilter.h>' "${mihw}/millet_pkg.c"
-		info "patched millet_pkg.c (netfilter.h)"
+
+	# millet_pkg.c: nf_register_net_hooks 需要 netfilter.h 及其 IPv4/IPv6 扩展
+	if [ -f "${mihw}/millet_pkg.c" ]; then
+		if ! grep -q '#include <linux/netfilter.h>' "${mihw}/millet_pkg.c"; then
+			sed -i '1i #include <linux/netfilter.h>\n#include <linux/netfilter_ipv4.h>\n#include <linux/netfilter_ipv6.h>' "${mihw}/millet_pkg.c"
+			info "patched millet_pkg.c (netfilter.h + ipv4/ipv6)"
+		fi
 	fi
 }
 
