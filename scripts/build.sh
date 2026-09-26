@@ -132,9 +132,11 @@ build_kernel() {
 	fi
 
 	cd "$KERNEL_DIR"
-	info "make ${args} ${KERNEL_CONFIG}"
+	mkdir -p "$OUT"
+	info "make ${args} defconfig (copied from ${KERNEL_CONFIG})"
+	cp "$DEFCONFIG_PATH" "${OUT}/.config"
 	# shellcheck disable=SC2086
-	make -j"$(nproc --all)" CC=clang $args "${KERNEL_CONFIG}" \
+	make -j"$(nproc --all)" CC=clang $args olddefconfig \
 		|| die "defconfig generation failed"
 
 	info "make ${args}"
