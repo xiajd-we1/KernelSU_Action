@@ -85,8 +85,8 @@ setup_clang() {
 			warn "master-kernel-build-2022/r450784e"
 		fi
 
-		fetch "${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz" \
-			"${WORKSPACE}/clang.tar.gz"
+		fetch "https://mirror.ghproxy.com/${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz" \
+    "${WORKSPACE}/clang.tar.gz"
 		extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR"
 	fi
 
