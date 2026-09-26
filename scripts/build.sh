@@ -9,93 +9,112 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/patches.sh"
 
 KERNEL_DIR=${KERNEL_DIR:?KERNEL_DIR must be set}
-WORKSPACE=${WORKSPACE:-$(cd "${KERNEL_DIR}/.." && pwd)}
-ARCH=${ARCH:-arm64}
-OUT="${KERNEL_DIR}/out"
-DEFCONFIG_PATH="${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}"
+WORKSPACE=${WORKSPACE:?WORKSPACE must be set}
+OUT="${WORKSPACE}/out"
 
 prepare_defconfig() {
 	group "Preparing defconfig"
-	[ -f "$DEFCONFIG_PATH" ] \
+	[ -f "${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" ] \
 		|| die "defconfig not found: arch/${ARCH}/configs/${KERNEL_CONFIG}
-       Available: $(ls "${KERNEL_DIR}/arch/${ARCH}/configs/" | head -20 | tr '\n' ' ')"
-	cp "$DEFCONFIG_PATH" "${WORKSPACE}/defconfig.orig"
+Available configs: $(ls "${KERNEL_DIR}/arch/${ARCH}/configs/" | head -20 | tr '\n' ' ')"
+	cp "${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" "${WORKSPACE}/defconfig.orig"
 	local kver
-	kver=$(kernel_version "$KERNEL_DIR")
-	info "Kernel version detected: $kver"
+	kver=$(kernel_version "$KERNEL_DIR" || echo "0.0")
+	if [ "${KSU_VARIANT:-none}" != "none" ]; then
+		kconf_enable "${WORKSPACE}/defconfig.orig" CONFIG_KSU
+		ksu_hook_configs "${KSU_VARIANT}" "${KSU_HOOK_MODE:-auto}" "${WORKSPACE}/defconfig.orig" "$kver"
+		if is_true "${ENABLE_SUSFS:-false}"; then
+			susfs_defconfig "${WORKSPACE}/defconfig.orig"
+		fi
+		if is_true "${ENABLE_KPM:-false}"; then
+			# patch_linux resolves symbols at runtime, so kallsyms must be complete.
+			kconf_set_many "${WORKSPACE}/defconfig.orig" \
+				CONFIG_KPM=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y
+		fi
+	fi
+	# Overlayfs backs KernelSU's module mounts and writes to /system.
+	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "${WORKSPACE}/defconfig.orig" CONFIG_OVERLAY_FS
+	# Kept as standalone toggle for kernels that need kprobes but not overlayfs.
+	is_true "${ADD_KPROBES_CONFIG:-false}" && kconf_set_many "${WORKSPACE}/defconfig.orig" \
+		CONFIG_MODULES=y CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y
 
-	# 关闭栈保护，解决 __stack_chk_guard 链接错误，不触碰vendor驱动
-	kconf_set_many "$DEFCONFIG_PATH" \
+	if is_true "${DISABLE_LTO:-false}"; then
+		kconf_set_many "${WORKSPACE}/defconfig.orig" \
+			CONFIG_LTO=n CONFIG_LTO_CLANG=n CONFIG_LTO_CLANG_FULL=n \
+			CONFIG_LTO_CLANG_THIN=n CONFIG_THINLTO=n
+	fi
+	is_true "${DISABLE_CC_WERROR:-false}" && kconf_disable "${WORKSPACE}/defconfig.orig" CONFIG_CC_WERROR
+
+	# 关闭栈保护，解决 __stack_chk_guard 链接报错
+	kconf_set_many "${WORKSPACE}/defconfig.orig" \
 		CONFIG_STACKPROTECTOR=n \
 		CONFIG_STACKPROTECTOR_STRONG=n
 
-	kconf_enable "$DEFCONFIG_PATH" CONFIG_CGROUPS
-	kconf_enable "$DEFCONFIG_PATH" CONFIG_CGROUP_FREEZER
-	kconf_enable "$DEFCONFIG_PATH" CONFIG_PROC_PID_CPUSET
+	# Free‑form extras: one CONFIG_x=y per line, or space separated.
+	if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
+		local kv
+		# shellcheck disable=SC2086
+		for kv in $(printf '%s' "$EXTRA_DEFCONFIG" | tr '\n' ' '); do
+			[ -n "$kv" ] || continue
+			case "$kv" in
+				*=*) kconf_set "${WORKSPACE}/defconfig.orig" "${kv%%=*}" "${kv#*=}" ;;
+				*)   warn "ignoring malformed EXTRA_DEFCONFIG entry '${kv}' (want CONFIG_X=y)" ;;
+			esac
+		done
+	fi
+
+	# A stable LOCALVERSION keeps artifact filenames predictable.
+	if [ -n "${KERNEL_NAME:-}" ]; then
+		kconf_set "${WORKSPACE}/defconfig.orig" CONFIG_LOCALVERSION "\"-${KERNEL_NAME}\""
+		if [ -f "${KERNEL_DIR}/scripts/setlocalversion" ]; then
+			sed -i 's/echo "\$res"/echo "\$res"/; s/-dirty//g' "${KERNEL_DIR}/scripts/setlocalversion"
+		fi
+	fi
 
 	info "defconfig changes:"
-	diff -u "${WORKSPACE}/defconfig.orig" "$DEFCONFIG_PATH" | sed -n '4,$p' | sed 's/^/    /' || true
+	diff -u "${KERNEL_DIR}/arch/${ARCH}/configs/${KERNEL_CONFIG}" "${WORKSPACE}/defconfig.orig" | sed -n '4,$p' | sed 's/^/    /' || true
+
+	mkdir -p "$OUT"
+	cp "${WORKSPACE}/defconfig.orig" "${OUT}/.config"
+	cd "$KERNEL_DIR"
+	make ${MAKE_ARGS:-} O="$OUT" olddefconfig >/dev/null
+	cd - >/dev/null
 	endgroup
 }
 
 build_kernel() {
 	group "Building kernel"
-	export PATH="${CLANG_PATH:-}:${PATH}"
-	export KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-Github-Action}
-	export KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-kernelsu-action}
-	unset DISABLE_LTO
+	export PATH="${CLANG_PATH}:${PATH}"
+	export LD_LIBRARY_PATH="${CLANG_PATH}/lib:${LD_LIBRARY_PATH:-}"
 
-	if [ -n "${KSU_EXPECTED_SIZE:-}" ] && [ -n "${KSU_EXPECTED_HASH:-}" ]; then
-		export KSU_EXPECTED_SIZE KSU_EXPECTED_HASH
-		info "using custom manager signature (size=${KSU_EXPECTED_SIZE})"
-	fi
-
-	local cc="clang" args
+	local args
 	args=$(make_args)
-
-	if is_true "${ENABLE_CCACHE:-true}" && command -v ccache >/dev/null; then
-		cc="ccache clang"
-		export CCACHE_DIR="${CCACHE_DIR:-${WORKSPACE}/.ccache}"
-		info "ccache enabled"
-	fi
-
-	cd "$KERNEL_DIR"
-	# 关键：注释掉高危的patch_vendor_drivers，不再修改datarmnet/mihw驱动
-	# patch_vendor_drivers
-
-	mkdir -p "$OUT"
-	info "make ${args} defconfig (copied from ${KERNEL_CONFIG})"
-	cp "$DEFCONFIG_PATH" "${OUT}/.config"
-	make -j"$(nproc --all)" CC=clang $args olddefconfig \
-		|| die "defconfig generation failed"
-
-	info "Starting kernel compile, make args: $args"
-	make -j"$(nproc --all)" CC="$cc" $args \
-		|| die "kernel build failed"
+	# shellcheck disable=SC2086
+	make -j"$(nproc)" ${args} O="$OUT" > build.log 2>&1 || {
+		cat build.log
+		die "kernel build failed"
+	}
 	endgroup
 }
 
 check_output() {
 	group "Checking build output"
 	local boot="${OUT}/arch/${ARCH}/boot"
-	local image="${boot}/${KERNEL_IMAGE_NAME}"
-	[ -f "$image" ] || die "expected kernel image not found: ${image}
-       Built files: $(ls "$boot" 2>/dev/null | tr '\n' ' ')
-       Check that KERNEL_IMAGE_NAME matches what your kernel produces."
-	ok "kernel image: ${KERNEL_IMAGE_NAME} ($(du -h "$image" | cut -f1))"
-	export_env CHECK_FILE_IS_OK true
+	[ -d "$boot" ] || die "boot dir missing: ${boot}"
 
-	if is_true "${NEED_DTBO:-false}"; then
-		[ -f "${boot}/dtbo.img" ] || warn "dtbo.img not generated"
-		ok "dtbo.img found"
+	# KPM rewrites image in‑place; must run after build before packaging.
+	if is_true "${ENABLE_KPM:-false}"; then
+		local img
+		img=$(find "$boot" -maxdepth 1 -name 'Image*' | head -n1)
+		[ -n "$img" ] && kpm_patch_image "$img"
 	fi
 
 	if [ -f "${OUT}/include/generated/utsrelease.h" ]; then
 		local rel
-		rel=$(sed -n 's/^#define UTS_RELEASE "\(.*\)"/\1/p' "${OUT}/include/generated/utsrelease.h")
+		rel=$(sed -nE 's/.*UTS_RELEASE[[:space:]]+"([^"]+)".*/\1/p' "${OUT}/include/generated/utsrelease.h")
 		export_env KERNEL_RELEASE "$rel"
 		ok "kernel release: ${rel}"
-		summary "| Kernel Release | \`${rel}\` |"
+		summary "| Kernel release | \`${rel}\` |"
 	fi
 	endgroup
 }
