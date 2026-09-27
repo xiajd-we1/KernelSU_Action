@@ -43,6 +43,12 @@ prepare_defconfig() {
 		fi
 	fi
 
+	# 关闭栈保护，避免 __stack_chk_guard 未定义
+	kconf_set_many "$DEFCONFIG_PATH" \
+		CONFIG_STACKPROTECTOR=n \
+		CONFIG_STACKPROTECTOR_STRONG=n \
+		CONFIG_STACKPROTECTOR_PER_TASK=n
+
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
 	if is_true "${ADD_KPROBES_CONFIG:-false}"; then
@@ -95,21 +101,29 @@ make_args() {
 	fi
 }
 
-# 彻底移除 5.4 内核编译不过的 vendor 驱动
+# 彻底把 5.4 内核编译不过/链接不过的 vendor 驱动移出源码树
 patch_vendor_drivers() {
 	local drivers_mk="${KERNEL_DIR}/drivers/Makefile"
-	local de_mk="${KERNEL_DIR}/techpack/datarmnet-ext/Makefile"
+	local disabled_dir="${WORKSPACE}/_disabled_drivers"
+	mkdir -p "$disabled_dir"
 
-	# 1) 从 drivers/Makefile 移除 CONFIG_MIHW —— 彻底禁用 millet 系列驱动
+	# 1) 从 drivers/Makefile 移除 CONFIG_MIHW —— 禁用 millet 系列
 	if [ -f "$drivers_mk" ] && grep -q "CONFIG_MIHW" "$drivers_mk"; then
 		sed -i '/CONFIG_MIHW/d' "$drivers_mk"
 		info "disabled drivers/mihw in drivers/Makefile"
 	fi
 
-	# 2) 从 techpack/datarmnet-ext/Makefile 移除 shs/ —— rmnet_shs 依赖 5.10+ 的 rps_map
-	if [ -f "$de_mk" ] && grep -q "shs/" "$de_mk"; then
-		sed -i 's|obj-y += offload/ shs/|obj-y += offload/|' "$de_mk"
-		info "disabled techpack/datarmnet-ext/shs"
+	# 2) 把整个 techpack/datarmnet 移出源码树
+	#    （改名加前缀不行，顶层 Makefile 用 find 扫描 techpack/ 下所有目录）
+	if [ -d "${KERNEL_DIR}/techpack/datarmnet" ]; then
+		mv "${KERNEL_DIR}/techpack/datarmnet" "${disabled_dir}/datarmnet"
+		info "moved techpack/datarmnet out of source tree"
+	fi
+
+	# 3) 把整个 techpack/datarmnet-ext 移出源码树
+	if [ -d "${KERNEL_DIR}/techpack/datarmnet-ext" ]; then
+		mv "${KERNEL_DIR}/techpack/datarmnet-ext" "${disabled_dir}/datarmnet-ext"
+		info "moved techpack/datarmnet-ext out of source tree"
 	fi
 }
 
