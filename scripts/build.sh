@@ -38,19 +38,17 @@ prepare_defconfig() {
 		fi
 
 		if is_true "${ENABLE_KPM:-false}"; then
+			# patch_linux resolves symbols at runtime, so kallsyms must be complete.
 			kconf_set_many "$DEFCONFIG_PATH" \
 				CONFIG_KPM=y CONFIG_KALLSYMS=y CONFIG_KALLSYMS_ALL=y
 		fi
 	fi
 
-	# 关闭栈保护，避免 __stack_chk_guard 未定义
-	kconf_set_many "$DEFCONFIG_PATH" \
-		CONFIG_STACKPROTECTOR=n \
-		CONFIG_STACKPROTECTOR_STRONG=n \
-		CONFIG_STACKPROTECTOR_PER_TASK=n
-
+	# Overlayfs backs KernelSU's module mounts and system-partition writes.
 	is_true "${ADD_OVERLAYFS_CONFIG:-false}" && kconf_enable "$DEFCONFIG_PATH" CONFIG_OVERLAY_FS
 
+	# Kept as a standalone switch for kernels that need kprobes for their own
+	# reasons, independent of the hook mode.
 	if is_true "${ADD_KPROBES_CONFIG:-false}"; then
 		kconf_set_many "$DEFCONFIG_PATH" \
 			CONFIG_MODULES=y CONFIG_KPROBES=y CONFIG_HAVE_KPROBES=y CONFIG_KPROBE_EVENTS=y
@@ -64,17 +62,21 @@ prepare_defconfig() {
 
 	is_true "${DISABLE_CC_WERROR:-false}" && kconf_disable "$DEFCONFIG_PATH" CONFIG_CC_WERROR
 
+	# Free-form extras: one CONFIG_x=y per line, or space separated.
 	if [ -n "${EXTRA_DEFCONFIG:-}" ]; then
 		local kv
+		# shellcheck disable=SC2086
 		for kv in $(printf '%s' "$EXTRA_DEFCONFIG" | tr '\n' ' '); do
 			[ -n "$kv" ] || continue
 			case "$kv" in
 				*=*) kconf_set "$DEFCONFIG_PATH" "${kv%%=*}" "${kv#*=}" ;;
-				*)   warn "ignoring malformed EXTRA_DEFCONFIG entry '${kv}' (want CONFIG_x=y)" ;;
+				*)   warn "ignoring malformed EXTRA_DEFCONFIG entry '${kv}' (want CONFIG_X=y)" ;;
 			esac
 		done
 	fi
 
+	# A stable LOCALVERSION keeps artifact names predictable. Without this the
+	# tree appends "-dirty" as soon as any patch above touches a tracked file.
 	if [ -n "${KERNEL_NAME:-}" ]; then
 		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"-${KERNEL_NAME}\""
 		if [ -f "${KERNEL_DIR}/scripts/setlocalversion" ]; then
@@ -101,40 +103,21 @@ make_args() {
 	fi
 }
 
-# 彻底把 5.4 内核编译不过/链接不过的 vendor 驱动移出源码树
-patch_vendor_drivers() {
-	local drivers_mk="${KERNEL_DIR}/drivers/Makefile"
-	local disabled_dir="${WORKSPACE}/_disabled_drivers"
-	mkdir -p "$disabled_dir"
-
-	# 1) 从 drivers/Makefile 移除 CONFIG_MIHW —— 禁用 millet 系列
-	if [ -f "$drivers_mk" ] && grep -q "CONFIG_MIHW" "$drivers_mk"; then
-		sed -i '/CONFIG_MIHW/d' "$drivers_mk"
-		info "disabled drivers/mihw in drivers/Makefile"
-	fi
-
-	# 2) 把整个 techpack/datarmnet 移出源码树
-	#    （改名加前缀不行，顶层 Makefile 用 find 扫描 techpack/ 下所有目录）
-	if [ -d "${KERNEL_DIR}/techpack/datarmnet" ]; then
-		mv "${KERNEL_DIR}/techpack/datarmnet" "${disabled_dir}/datarmnet"
-		info "moved techpack/datarmnet out of source tree"
-	fi
-
-	# 3) 把整个 techpack/datarmnet-ext 移出源码树
-	if [ -d "${KERNEL_DIR}/techpack/datarmnet-ext" ]; then
-		mv "${KERNEL_DIR}/techpack/datarmnet-ext" "${disabled_dir}/datarmnet-ext"
-		info "moved techpack/datarmnet-ext out of source tree"
-	fi
-}
-
 build_kernel() {
 	group "Building kernel"
 	export PATH="${CLANG_PATH:-}:${PATH}"
 	export KBUILD_BUILD_HOST=${KBUILD_BUILD_HOST:-Github-Action}
 	export KBUILD_BUILD_USER=${KBUILD_BUILD_USER:-kernelsu-action}
 
+	# DISABLE_LTO is this action's boolean configuration switch, but several
+	# Android kernel trees use the same Make variable for compiler flags (for
+	# example, "-fno-lto").  Leaving our value in the environment makes a
+	# non-LTO build invoke `clang ... false ...`, treating "false" as an input
+	# file.  prepare_defconfig() has already consumed the action setting, so let
+	# Kbuild own the name from this point on.
 	unset DISABLE_LTO
 
+	# Custom manager signature, when the user builds their own manager APK.
 	if [ -n "${KSU_EXPECTED_SIZE:-}" ] && [ -n "${KSU_EXPECTED_HASH:-}" ]; then
 		export KSU_EXPECTED_SIZE KSU_EXPECTED_HASH
 		info "using custom manager signature (size=${KSU_EXPECTED_SIZE})"
@@ -149,15 +132,9 @@ build_kernel() {
 	fi
 
 	cd "$KERNEL_DIR"
-
-	# 移除编译不过的 vendor 驱动
-	patch_vendor_drivers
-
-	mkdir -p "$OUT"
-	info "make ${args} defconfig (copied from ${KERNEL_CONFIG})"
-	cp "$DEFCONFIG_PATH" "${OUT}/.config"
+	info "make ${args} ${KERNEL_CONFIG}"
 	# shellcheck disable=SC2086
-	make -j"$(nproc --all)" CC=clang $args olddefconfig \
+	make -j"$(nproc --all)" CC=clang $args "${KERNEL_CONFIG}" \
 		|| die "defconfig generation failed"
 
 	info "make ${args}"
@@ -188,10 +165,13 @@ check_output() {
 		ok "dtbo.img present"
 	fi
 
+	# KPM rewrites the image in place, so it has to happen after the build and
+	# before packaging.
 	if is_true "${ENABLE_KPM:-false}"; then
 		kpm_patch_image "$image"
 	fi
 
+	# Record the version string the kernel actually reports.
 	if [ -f "${OUT}/include/generated/utsrelease.h" ]; then
 		local rel
 		rel=$(sed -nE 's/.*UTS_RELEASE[[:space:]]+"([^"]+)".*/\1/p' "${OUT}/include/generated/utsrelease.h")
