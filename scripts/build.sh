@@ -95,6 +95,53 @@ make_args() {
 	fi
 }
 
+# 修掉 5.4 内核里不兼容的 vendor 驱动
+patch_vendor_drivers() {
+	local de_mk="${KERNEL_DIR}/techpack/datarmnet-ext/Makefile"
+	local mihw="${KERNEL_DIR}/drivers/mihw"
+
+	# 1) datarmnet-ext：从 Makefile 移除 shs/（rmnet_shs 依赖 5.10+ 的 rps_map）
+	if [ -f "$de_mk" ] && grep -q "shs/" "$de_mk"; then
+		sed -i 's|obj-y += offload/ shs/|obj-y += offload/|' "$de_mk"
+		info "removed techpack/datarmnet-ext/shs from Makefile"
+	fi
+
+	# 2) drivers/mihw：补头文件 + 修正 nf_register_net_hooks 参数
+	if [ -d "$mihw" ]; then
+		if [ -f "${mihw}/millet_core.c" ] && ! grep -q "cgroup-defs.h" "${mihw}/millet_core.c"; then
+			sed -i '1i #include <linux/cgroup.h>\n#include <linux/cgroup-defs.h>' "${mihw}/millet_core.c"
+			info "patched millet_core.c (cgroup)"
+		fi
+		if [ -f "${mihw}/millet_pkg.c" ] && ! grep -q "nf_register_net_hooks" "${mihw}/millet_pkg.c"; then
+			python3 - "${mihw}/millet_pkg.c" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path, "r") as f:
+    content = f.read()
+header = """#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6.h>
+
+extern int nf_register_net_hooks(struct net *net,
+                                 const struct nf_hook_ops *reg);
+extern void nf_unregister_net_hooks(struct net *net,
+                                    const struct nf_hook_ops *reg);
+"""
+content = content.replace(
+    "nf_register_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops))",
+    "nf_register_net_hooks(net, pkg_nf_ops)"
+).replace(
+    "nf_unregister_net_hooks(net, pkg_nf_ops, ARRAY_SIZE(pkg_nf_ops))",
+    "nf_unregister_net_hooks(net, pkg_nf_ops)"
+)
+with open(path, "w") as f:
+    f.write(header + content)
+PYEOF
+			info "patched millet_pkg.c (netfilter + 2-arg calls)"
+		fi
+	fi
+}
+
 build_kernel() {
 	group "Building kernel"
 	export PATH="${CLANG_PATH:-}:${PATH}"
@@ -117,6 +164,10 @@ build_kernel() {
 	fi
 
 	cd "$KERNEL_DIR"
+
+	# 修复 5.4 内核不兼容的 vendor 驱动
+	patch_vendor_drivers
+
 	mkdir -p "$OUT"
 	info "make ${args} defconfig (copied from ${KERNEL_CONFIG})"
 	cp "$DEFCONFIG_PATH" "${OUT}/.config"
